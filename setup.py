@@ -1,0 +1,197 @@
+# SPDX-FileCopyrightText: Copyright 2023-2025 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import glob
+import os
+import os.path as osp
+import pathlib
+import platform
+import sys
+
+# Automatically set CUDA_HOME on Windows/Linux if it is missing
+if "CUDA_HOME" not in os.environ:
+    if "CUDA_PATH" in os.environ:
+        os.environ["CUDA_HOME"] = os.environ["CUDA_PATH"]
+        print(f"--- gsplat build: CUDA_HOME set from CUDA_PATH: {os.environ['CUDA_HOME']} ---")
+    else:
+        # Fallback to standard installation locations on Windows
+        for v in ["v12.1", "v12.8", "v11.8", "v11.7"]:
+            pth = os.path.join(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA", v)
+            if os.path.exists(pth):
+                os.environ["CUDA_HOME"] = pth
+                print(f"--- gsplat build: CUDA_HOME auto-detected at physical path: {pth} ---")
+                break
+        else:
+            print("--- gsplat build: Warning: CUDA_HOME could not be auto-detected! ---")
+else:
+    print(f"--- gsplat build: CUDA_HOME already set to: {os.environ['CUDA_HOME']} ---")
+
+from setuptools import find_packages, setup
+
+# --- Monkey-patch torch.utils.cpp_extension ---
+# PyTorch forcibly injects __CUDA_NO_HALF_OPERATORS__ into both NVCC and MSVC flags on Windows,
+# which causes a fatal conflict with CUB templates inside IntersectTile.cu.
+# We intercept and remove these before PyTorch processes the extension.
+try:
+    import torch.utils.cpp_extension as torch_cpp_ext
+    for flag in [
+        "-D__CUDA_NO_HALF_OPERATORS__",
+        "-D__CUDA_NO_HALF_CONVERSIONS__",
+        "-D__CUDA_NO_HALF2_OPERATORS__",
+        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    ]:
+        if flag in torch_cpp_ext.COMMON_NVCC_FLAGS:
+            torch_cpp_ext.COMMON_NVCC_FLAGS.remove(flag)
+
+    original_add_gnu_cpp_abi_flag = getattr(torch_cpp_ext, "_add_gnu_cpp_abi_flag", None)
+    if original_add_gnu_cpp_abi_flag is not None:
+        def patched_add_gnu_cpp_abi_flag(cflags):
+            original_add_gnu_cpp_abi_flag(cflags)
+            for flag in [
+                "/D__CUDA_NO_HALF_OPERATORS__",
+                "/D__CUDA_NO_HALF_CONVERSIONS__",
+                "/D__CUDA_NO_HALF2_OPERATORS__",
+                "/D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            ]:
+                while flag in cflags:
+                    cflags.remove(flag)
+        torch_cpp_ext._add_gnu_cpp_abi_flag = patched_add_gnu_cpp_abi_flag
+except ImportError:
+    pass
+# ---------------------------------------------
+
+__version__ = None
+exec(open("gsplat/version.py", "r").read())
+
+URL = "https://github.com/nerfstudio-project/gsplat"
+
+BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
+
+
+def get_ext():
+    from torch.utils.cpp_extension import BuildExtension
+
+    return BuildExtension.with_options(no_python_abi_suffix=True, use_ninja=True)
+
+
+def get_extensions():
+    from torch.utils.cpp_extension import CUDAExtension
+
+    # Use the same build parameters as the JIT build. However, directly
+    # importing the gsplat.cuda.build module would trigger a circular
+    # dependency where gsplat is imported before it is built. To avoid
+    # this, we sidestep the traditional Python import mechanism and construct
+    # the module directly from build.py.
+    import importlib.util
+
+    def _load_build_module(module_name, build_py_path):
+        spec = importlib.util.spec_from_file_location(module_name, build_py_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    setup_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # --- gsplat main extension ---
+    # --- gsplat main extension ---
+    gsplat_build = _load_build_module(
+        "gsplat_cuda_build", os.path.join("gsplat", "cuda", "build.py")
+    )
+    params = gsplat_build.get_build_parameters()
+    sources = [os.path.relpath(s, setup_dir) for s in params.sources]
+    gsplat_ext = CUDAExtension(
+        "gsplat.csrc",
+        sources=sources,
+        include_dirs=params.extra_include_paths,
+        extra_compile_args={
+            "cxx": params.extra_cflags,
+            "nvcc": params.extra_cuda_cflags,
+        },
+        extra_link_args=params.extra_ldflags,
+    )
+
+    # --- experimental Inference render extension ---
+    inference_build = _load_build_module(
+        "experimental_gaussian_render_inference_scene_build",
+        os.path.join("experimental", "render", "kernels", "cuda", "build.py"),
+    )
+    inference_params = inference_build.get_build_parameters()
+    inference_sources = [
+        os.path.relpath(s, setup_dir) for s in inference_params.sources
+    ]
+    inference_ext = CUDAExtension(
+        "experimental.render.kernels.csrc",
+        sources=inference_sources,
+        include_dirs=inference_params.extra_include_paths,
+        extra_compile_args={
+            "cxx": inference_params.extra_cflags,
+            "nvcc": inference_params.extra_cuda_cflags,
+        },
+        extra_link_args=inference_params.extra_ldflags,
+    )
+
+    return [gsplat_ext, inference_ext]
+
+
+setup(
+    name="gsplat",
+    version=__version__,
+    description=" Python package for differentiable rasterization of gaussians",
+    keywords="gaussian, splatting, cuda",
+    url=URL,
+    download_url=f"{URL}/archive/gsplat-{__version__}.tar.gz",
+    python_requires=">=3.7",
+    install_requires=[
+        "ninja",
+        "numpy",
+        "jaxtyping",
+        "rich>=12",
+        "torch",
+        "typing_extensions; python_version<'3.8'",
+        # gsplat-scene / gsplat-stage live under libs/scene and libs/stage and
+        # are installed via ``libs/install.sh scene && libs/install.sh stage``;
+        # they are not published, so listing them here would break ``pip install``.
+    ],
+    extras_require={
+        # lidar dependencies. Install them by `pip install gsplat[lidar]`
+        "lidar": [
+            "scipy",
+        ],
+        # dev dependencies. Install them by `pip install gsplat[dev]`
+        "dev": [
+            "black[jupyter]==22.3.0",
+            "isort==5.10.1",
+            "pylint==2.13.4",
+            "pytest==7.1.3",
+            "pytest-env==0.8.1",
+            "pytest-xdist==2.5.0",
+            "typeguard>=2.13.3",
+            "pyyaml>=6.0.1",
+            "build",
+            "twine",
+            "cupy",
+            "nerfacc>=0.5.3",
+            "PLAS @ git+https://github.com/fraunhoferhhi/PLAS.git",
+            "imageio>=2.37.2",
+            "torchpq>=0.3.0.6",
+        ],
+    },
+    ext_modules=get_extensions() if not BUILD_NO_CUDA else [],
+    cmdclass={"build_ext": get_ext()} if not BUILD_NO_CUDA else {},
+    packages=find_packages(),
+    # https://github.com/pypa/setuptools/issues/1461#issuecomment-954725244
+    include_package_data=True,
+)
