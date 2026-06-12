@@ -2473,16 +2473,80 @@ def rasterization_lod(
     width: int,
     height: int,
     lod_threshold: float = 0.05,
+    lod_fade_ratio: float = 0.2,
+    frustum_planes: Optional[Tensor] = None,
     **kwargs,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians dynamically using an LOD Spatial Octree hierarchy.
-    
-    This function traverses the provided Octree hierarchy based on the camera position(s)
-    to select a camera-pose-dependent mixture of merged simplified Gaussians (for distant cells)
-    and original high-fidelity Gaussians (for close cells), and then invokes the original
-    rasterization function to render the frame.
+
+    Optionally applies a View Frustum Culling (VFC) pre-pass (Layer 2 of the
+    optimisation pipeline) before traversing the octree.  When ``frustum_planes``
+    is provided (shape ``(6, 4)`` as returned by
+    ``vfc_culling.extract_frustum_planes``), every octree node whose AABB is
+    entirely outside at least one frustum half-space is skipped — both itself
+    and all its descendants — before the Python traversal loop begins.
+
+    This function traverses the provided Octree hierarchy based on the camera
+    position(s) to select a camera-pose-dependent mixture of merged simplified
+    Gaussians (for distant cells) and original high-fidelity Gaussians (for
+    close cells), and then invokes the original rasterization function to render
+    the frame.
+
+    Args:
+        frustum_planes: Optional tensor of shape ``(6, 4)`` containing the six
+            normalised frustum clip-planes produced by
+            ``vfc_culling.extract_frustum_planes(VP)``.  When *None* (default),
+            VFC is skipped and behaviour is identical to the pre-VFC baseline.
     """
+    # -----------------------------------------------------------------------
+    # Layer 2: View Frustum Culling — vectorised AABB pre-filter
+    # -----------------------------------------------------------------------
+    # Build a set of node object-ids that pass the frustum test.  The set is
+    # populated in O(N_nodes) with one batched PyTorch call; the traverse()
+    # closure below does an O(1) set-membership check per node.
+    #
+    # When frustum_planes is None the set is left as None and every node is
+    # treated as visible (identical to the original behaviour).
+    _vfc_visible: Optional[set] = None
+
+    if frustum_planes is not None:
+        # Collect AABBs from every node in the tree (BFS).
+        _bfs_nodes = []
+        _bfs_queue = [lod_octree.root]
+        while _bfs_queue:
+            _node = _bfs_queue.pop(0)
+            _bfs_nodes.append(_node)
+            _bfs_queue.extend(_node.children)
+
+        if len(_bfs_nodes) > 0:
+            _dev = frustum_planes.device
+            # Stack all min/max corners: (N_nodes, 3) each
+            _aabb_min = torch.stack(
+                [n.aabb[0].to(device=_dev, dtype=torch.float32) for n in _bfs_nodes], dim=0
+            )
+            _aabb_max = torch.stack(
+                [n.aabb[1].to(device=_dev, dtype=torch.float32) for n in _bfs_nodes], dim=0
+            )
+
+            from vfc_culling import cull_octree_nodes as _cull_fn
+            _vis_mask = _cull_fn(_aabb_min, _aabb_max, frustum_planes)  # (N_nodes,) bool
+
+            # Store ids of *visible* nodes for O(1) lookup in traverse()
+            _vfc_visible = {
+                id(_bfs_nodes[i])
+                for i in range(len(_bfs_nodes))
+                if bool(_vis_mask[i])
+            }
+            _vfc_culled = len(_bfs_nodes) - len(_vfc_visible)
+            if _vfc_culled > 0:
+                print(
+                    f"[VFC] Culled {_vfc_culled}/{len(_bfs_nodes)} octree nodes "
+                    f"({100.0 * _vfc_culled / len(_bfs_nodes):.1f}%) before traversal."
+                )
+
+    # -----------------------------------------------------------------------
     # Extract camera position in world coordinates
+    # -----------------------------------------------------------------------
     campos = viewmat_to_camera_position(viewmats)  # [..., C, 3]
     campos_flat = campos.reshape(-1, 3)
 
@@ -2520,94 +2584,111 @@ def rasterization_lod(
             has_sh = True
             K = orig_colors.shape[-2]
 
-    def traverse(node):
+    def _append_merged(node, alpha_mult=1.0):
+        data = node.merged_splat_data
+        merged_scales = data["scales"]
+        merged_opacities = data["opacities"]
+        if getattr(lod_octree, "raw_inputs", False):
+            merged_scales = torch.exp(merged_scales)
+            merged_opacities = torch.sigmoid(
+                merged_opacities.squeeze(-1)
+                if merged_opacities.ndim > 1
+                else merged_opacities
+            )
+        
+        # #region agent log
+        _lod_dbg["n_merged"] += int(merged_scales.shape[0])
+        if _lod_dbg["merged_scale_raw_mean"] is None:
+            _lod_dbg["merged_scale_raw_mean"] = float(data["scales"].detach().float().mean().item())
+            _lod_dbg["merged_scale_out_mean"] = float(merged_scales.detach().float().mean().item())
+            _lod_dbg["merged_opacity_raw_mean"] = float(data["opacities"].detach().float().mean().item())
+            _lod_dbg["merged_opacity_out_mean"] = float(merged_opacities.detach().float().mean().item())
+        # #endregion
+
+        selected_means.append(data["means"])
+        selected_scales.append(merged_scales)
+        selected_quats.append(data["quats"])
+        selected_opacities.append(merged_opacities * alpha_mult)
+        
+        if orig_colors is not None:
+            if has_sh:
+                sh0_val = data["sh0"]  # [1, 1, 3]
+                ac_len = K - 1
+                if ac_len > 0:
+                    pad_ac = torch.zeros((1, ac_len, 3), dtype=sh0_val.dtype, device=sh0_val.device)
+                    full_sh = torch.cat([sh0_val, pad_ac], dim=1)
+                else:
+                    full_sh = sh0_val
+                selected_sh.append(full_sh)
+            else:
+                sh0_val = data["sh0"].squeeze(1)  # [1, 3]
+                if orig_colors.shape[-1] != 3:
+                    pad_len = orig_colors.shape[-1] - 3
+                    if pad_len > 0:
+                        pad = torch.zeros((1, pad_len), dtype=sh0_val.dtype, device=sh0_val.device)
+                        sh0_val = torch.cat([sh0_val, pad], dim=-1)
+                    else:
+                        sh0_val = sh0_val[:, :orig_colors.shape[-1]]
+                selected_sh.append(sh0_val)
+
+    def _append_leaf(node, alpha_mult=1.0):
+        indices = node.original_splat_indices
+        
+        # #region agent log
+        _lod_dbg["n_leaf"] += int(indices.numel())
+        if _lod_dbg["leaf_scale_mean"] is None and indices.numel() > 0:
+            _lod_dbg["leaf_scale_mean"] = float(orig_scales[indices].detach().float().mean().item())
+            _lod_dbg["leaf_opacity_mean"] = float(orig_opacities[indices].detach().float().mean().item())
+        # #endregion
+        
+        selected_means.append(orig_means[indices])
+        selected_scales.append(orig_scales[indices])
+        selected_quats.append(orig_quats[indices])
+        selected_opacities.append(orig_opacities[indices] * alpha_mult)
+        if orig_colors is not None:
+            selected_sh.append(orig_colors[indices])
+
+    def traverse(node, alpha_mult=1.0):
+        # ── Layer 2: View Frustum Culling guard ───────────────────────────
+        if _vfc_visible is not None and id(node) not in _vfc_visible:
+            return
+        # ─────────────────────────────────────────────────────────────────
+
         min_b, max_b = node.aabb
         center = 0.5 * (min_b + max_b)
         size = torch.norm(max_b - min_b)
-        
-        # Max projected size across all camera positions in the batch (union selection)
+
         dists = torch.norm(campos_flat - center, dim=-1)
         max_proj_size = torch.max(size / (dists + 1e-6)).item()
-        
-        if max_proj_size < lod_threshold or node.is_leaf:
-            if max_proj_size < lod_threshold and node.merged_splat_data is not None:
-                # Use simplified/merged node representation
-                data = node.merged_splat_data
-                merged_scales = data["scales"]
-                merged_opacities = data["opacities"]
-                # Merged nodes store log-scale / logit when raw_inputs=True; caller passes activated tensors for originals.
-                if getattr(lod_octree, "raw_inputs", False):
-                    merged_scales = torch.exp(merged_scales)
-                    merged_opacities = torch.sigmoid(
-                        merged_opacities.squeeze(-1)
-                        if merged_opacities.ndim > 1
-                        else merged_opacities
-                    )
-                # #region agent log
-                _lod_dbg["n_merged"] += int(merged_scales.shape[0])
-                if _lod_dbg["merged_scale_raw_mean"] is None:
-                    _lod_dbg["merged_scale_raw_mean"] = float(
-                        data["scales"].detach().float().mean().item()
-                    )
-                    _lod_dbg["merged_scale_out_mean"] = float(
-                        merged_scales.detach().float().mean().item()
-                    )
-                    _lod_dbg["merged_opacity_raw_mean"] = float(
-                        data["opacities"].detach().float().mean().item()
-                    )
-                    _lod_dbg["merged_opacity_out_mean"] = float(
-                        merged_opacities.detach().float().mean().item()
-                    )
-                # #endregion
-                selected_means.append(data["means"])
-                selected_scales.append(merged_scales)
-                selected_quats.append(data["quats"])
-                selected_opacities.append(merged_opacities)
-                
-                if orig_colors is not None:
-                    if has_sh:
-                        sh0_val = data["sh0"]  # [1, 1, 3]
-                        # Pad AC terms with zeros to match standard SH coefficients size
-                        ac_len = K - 1
-                        if ac_len > 0:
-                            pad_ac = torch.zeros((1, ac_len, 3), dtype=sh0_val.dtype, device=sh0_val.device)
-                            full_sh = torch.cat([sh0_val, pad_ac], dim=1)
-                        else:
-                            full_sh = sh0_val
-                        selected_sh.append(full_sh)
-                    else:
-                        sh0_val = data["sh0"].squeeze(1)  # [1, 3]
-                        if orig_colors.shape[-1] != 3:
-                            # Pad/trim to match original direct feature size
-                            pad_len = orig_colors.shape[-1] - 3
-                            if pad_len > 0:
-                                pad = torch.zeros((1, pad_len), dtype=sh0_val.dtype, device=sh0_val.device)
-                                sh0_val = torch.cat([sh0_val, pad], dim=-1)
-                            else:
-                                sh0_val = sh0_val[:, :orig_colors.shape[-1]]
-                        selected_sh.append(sh0_val)
+
+        # Alpha Fading parameters
+        fade_range = lod_fade_ratio * lod_threshold
+        lower_bound = lod_threshold - fade_range
+        upper_bound = lod_threshold + fade_range
+
+        if node.is_leaf:
+            _append_leaf(node, alpha_mult)
+            return
+
+        if max_proj_size <= lower_bound:
+            if node.merged_splat_data is not None:
+                _append_merged(node, alpha_mult)
             else:
-                # Use original leaf high-fidelity Gaussians
-                indices = node.original_splat_indices
-                # #region agent log
-                _lod_dbg["n_leaf"] += int(indices.numel())
-                if _lod_dbg["leaf_scale_mean"] is None and indices.numel() > 0:
-                    _lod_dbg["leaf_scale_mean"] = float(
-                        orig_scales[indices].detach().float().mean().item()
-                    )
-                    _lod_dbg["leaf_opacity_mean"] = float(
-                        orig_opacities[indices].detach().float().mean().item()
-                    )
-                # #endregion
-                selected_means.append(orig_means[indices])
-                selected_scales.append(orig_scales[indices])
-                selected_quats.append(orig_quats[indices])
-                selected_opacities.append(orig_opacities[indices])
-                if orig_colors is not None:
-                    selected_sh.append(orig_colors[indices])
-        else:
+                for child in node.children:
+                    traverse(child, alpha_mult)
+        elif max_proj_size >= upper_bound:
             for child in node.children:
-                traverse(child)
+                traverse(child, alpha_mult)
+        else:
+            # Transition zone: lerp opacity between merged parent and high-detail children
+            t = (max_proj_size - lower_bound) / (2 * fade_range) # 0.0 at lower_bound, 1.0 at upper_bound
+            if node.merged_splat_data is not None:
+                _append_merged(node, alpha_mult * (1.0 - t))
+                for child in node.children:
+                    traverse(child, alpha_mult * t)
+            else:
+                for child in node.children:
+                    traverse(child, alpha_mult)
 
     traverse(lod_octree.root)
 

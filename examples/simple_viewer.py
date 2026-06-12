@@ -36,6 +36,14 @@ from gsplat.rendering import rasterization, rasterization_lod
 from libs.scene import GaussianScene
 import experimental
 
+# Layer 2: View Frustum Culling — import the isolated intercept module
+try:
+    from vfc_culling import extract_frustum_planes as _vfc_extract_planes
+    _VFC_AVAILABLE = True
+except ImportError:
+    _VFC_AVAILABLE = False
+    print("[VFC] Warning: vfc_culling.py not found on sys.path; --enable_vfc will be a no-op.")
+
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 
@@ -287,6 +295,29 @@ def main(local_rank: int, world_rank, world_size: int, args):
             if args.use_gaussian_render_inference_scene:
                 ret = inference_renderer.render(**render_kwargs)
             elif args.enable_lod and lod_octree is not None:
+                # ── Layer 2: View Frustum Culling pre-pass ───────────────
+                _frustum_planes = None
+                if args.enable_vfc and _VFC_AVAILABLE:
+                    # Build the 4x4 view-projection matrix for this frame.
+                    # VP = K_hom @ viewmat  (world → NDC, column-vector convention)
+                    # K_hom pads the 3x3 intrinsic matrix to 4x4 by inserting
+                    # [0,0,1,0] and [0,0,0,1] rows/cols so that W=1 is preserved.
+                    _K3 = K  # (3, 3)
+                    _K_hom = torch.zeros(4, 4, device=device, dtype=torch.float32)
+                    _K_hom[:3, :3] = _K3
+                    _K_hom[2, 2] = 0.0       # row 2 col 2: replace 1 with 0 (NDC z row)
+                    _K_hom[2, 3] = 1.0       # near-plane coefficient
+                    _K_hom[3, 2] = 1.0       # homogeneous divide row
+                    # Use a simpler but correct VP: just use the viewmat directly
+                    # for axis-aligned plane extraction — adequate for AABB culling.
+                    # For a proper projection frustum, compose K_hom @ viewmat:
+                    _vp_mat = _K_hom @ viewmat  # (4, 4)
+                    try:
+                        _frustum_planes = _vfc_extract_planes(_vp_mat)
+                    except Exception as _vfc_err:
+                        print(f"[VFC] plane extraction failed: {_vfc_err}")
+                        _frustum_planes = None
+                # ─────────────────────────────────────────────────────────
                 render_colors_out, render_alphas_out, render_info = rasterization_lod(
                     lod_octree=lod_octree,
                     means=splats["means"],
@@ -295,6 +326,8 @@ def main(local_rank: int, world_rank, world_size: int, args):
                     opacities=splats["opacities"].sigmoid(),
                     colors=splats.get("colors", splats.get("sh0")),
                     lod_threshold=args.lod_threshold,
+                    lod_fade_ratio=args.lod_fade_ratio,
+                    frustum_planes=_frustum_planes,
                     **render_kwargs,
                 )
             else:
@@ -409,6 +442,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--lod_threshold", type=float, default=0.05, help="projected size activation threshold for LOD nodes"
+    )
+    parser.add_argument(
+        "--lod_fade_ratio", type=float, default=0.2, help="ratio of lod_threshold to use for smooth alpha blending transitions"
+    )
+    parser.add_argument(
+        "--enable_vfc",
+        action="store_true",
+        help="enable Layer 2 View Frustum Culling pre-pass (requires --enable_lod; uses vfc_culling.py)",
     )
     args = parser.parse_args()
     assert args.scene_grid % 2 == 1, "scene_grid must be odd"
